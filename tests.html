@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Mathbound checks</title><script src="engine.js"></script><script src="world.js"></script><script src="pixels.js"></script></head>
+<body>
+  <h1>Mathbound checks</h1><pre id="results">Running...</pre>
+  <iframe id="game" src="index.html?test=1" title="Game under test" width="400" height="900"></iframe>
+  <script>
+    "use strict";
+    const { Battle, MOVES, BOSSES, DIFFICULTIES, movesFor, explainProblem, question, counterQuestion } = window.MathBattle;
+    const { World, WIDTH, HEIGHT, SHRINES, FOUNTAIN, walkable, regionAt } = window.MathWorld;
+    const lines = [];
+    let failures = 0;
+    function check(name, run) {
+      try { run(); lines.push("PASS: " + name); }
+      catch (error) { failures++; lines.push("FAIL: " + name + " - " + error.message); }
+    }
+    function assert(condition, message = "Assertion failed") { if (!condition) throw new Error(message); }
+    function evaluate(text) {
+      // Expressions originate from the generator, never from player input.
+      return Function("return " + text.replaceAll("\u00d7", "*").replaceAll("\u00f7", "/").replaceAll("\u2212", "-"))();
+    }
+    function win(battle) {
+      let safety = 0;
+      while (!["won", "boss-defeated"].includes(battle.phase) && safety++ < 150) {
+        if (battle.phase === "ready") battle.choose("divide");
+        else if (["attack", "defense"].includes(battle.phase)) battle.submit(battle.problem.answer);
+        else battle.advance();
+      }
+      assert(["won", "boss-defeated"].includes(battle.phase), "Battle could not be won");
+    }
+    check("Harder attack and multistep counter questions have correct integer answers", () => {
+      for (let level = 0; level < 5; level++) {
+        for (let i = 0; i < 150; i++) {
+          for (const move of Object.keys(MOVES)) {
+            const q = question(move, level);
+            assert(q.answer === evaluate(q.text));
+            assert(Number.isInteger(q.answer) && q.answer >= 0);
+          }
+          const q = counterQuestion(level);
+          assert(q.answer === evaluate(q.text) && Number.isInteger(q.answer));
+          assert(q.text.split(" ").length >= 5);
+        }
+      }
+      assert(question("divide", 4, () => .999).answer === 26);
+      assert(BOSSES[0].hp === 110 && BOSSES[4].hp === 260);
+    });
+    check("Four moves preserve their damage ordering", () => {
+      let previous = 0;
+      for (const move of Object.keys(MOVES)) {
+        const battle = new Battle();
+        battle.choose(move);
+        const result = battle.submit(battle.problem.answer);
+        assert(result.damage === MOVES[move].damage && result.damage > previous);
+        assert(battle.bossHp === BOSSES[0].hp - result.damage);
+        previous = result.damage;
+      }
+    });
+    check("Choosing any strongest move updates actual damage without mutating defaults", () => {
+      for (const strongest of Object.keys(MOVES)) {
+        const moves = movesFor(strongest);
+        assert(moves[strongest].damage === 34);
+        assert(Object.values(moves).map(m => m.damage).sort((a,b) => a-b).join() === "10,16,24,34");
+        for (const move of Object.keys(MOVES)) {
+          const b = new Battle(Math.random, { strongest });
+          b.choose(move);
+          assert(b.submit(b.problem.answer).damage === moves[move].damage);
+        }
+      }
+      assert(MOVES.add.damage === 10 && MOVES.divide.damage === 34);
+      assert(movesFor("toString").divide.damage === 34);
+    });
+    check("Lessons explain every generated attack and counter in the correct order", () => {
+      for (const mode of Object.keys(DIFFICULTIES)) for (let level = 0; level < 5; level++) {
+        for (let i = 0; i < 30; i++) {
+          for (const move of Object.keys(MOVES)) {
+            const q = question(move, level, Math.random, mode);
+            assert(explainProblem(q).length === 1);
+          }
+          const q = counterQuestion(level, Math.random, mode), steps = explainProblem(q);
+          assert(steps.length > 0 && steps.at(-1).includes(`= ${q.answer}.`));
+        }
+      }
+      const steps = explainProblem({ text: "(4 + 6) \u00d7 3 \u2212 6", answer: 24 });
+      assert(steps[0].startsWith("4 + 6 = 10") && steps[1].startsWith("10 \u00d7 3 = 30") && steps[2].startsWith("30 \u2212 6 = 24"));
+      assert(explainProblem({ text: "12 \u00f7 3", answer: 4 })[0].includes("3 \u00d7 4 = 12"));
+      assert(explainProblem({ text: "12 + 8", answer: 20 })[0].includes("12 + 4 = 16"));
+      assert(explainProblem({ text: "3 \u00d7 4", answer: 12 })[0].includes("3 + 3 + 3 + 3 = 12"));
+      assert(explainProblem({ text: "3 \u00d7 (1 \u2212 3)", answer: -6 }).length === 2);
+      for (const q of [null, {}, { text: "alert(1)", answer: 1 }, { text: "1 + 2", answer: 7 }, { text: "2 \u00f7 0", answer: 0 }]) {
+        assert(explainProblem(q).length === 0);
+      }
+    });
+    check("Missed facts deduplicate, save practice status, and validate restored data", () => {
+      const w = new World(), problem = { text: "12 + 8", answer: 20 };
+      w.strongest = "add";
+      const fact = w.recordMiss(problem); fact.practiced = true;
+      const restored = new World(JSON.parse(JSON.stringify(w.save())));
+      assert(restored.strongest === "add" && restored.facts[0].practiced);
+      restored.recordMiss(problem);
+      assert(restored.facts.length === 1 && !restored.facts[0].practiced);
+      const bad = new World({ version: 1, strongest: "toString", facts: [null, {}, { text: "5 + 2", answer: 99 }, fact, fact] });
+      assert(bad.strongest === "divide" && bad.facts.length === 1);
+      for (let i = 0; i < 110; i++) w.recordMiss({ text: `${i} + 1`, answer: i + 1 });
+      assert(w.facts.length === 100);
+    });
+    check("Invalid answers and out-of-turn actions do not advance battle", () => {
+      const b = new Battle();
+      assert(b.submit(1) === null && !b.choose("toString") && !b.choose("nope"));
+      b.choose("add");
+      const q = b.problem;
+      for (const value of ["", " ", "1.2", "12abc", "Infinity", "99999999999999999999"]) {
+        assert(b.submit(value) === null && b.phase === "attack" && b.turn === 0);
+      }
+      assert(!b.choose("divide") && b.problem === q);
+      b.submit(q.answer);
+      assert(b.submit(q.answer) === null && !b.choose("add"));
+    });
+    check("Missed attacks trigger counters; correct defense blocks all damage", () => {
+      const b = new Battle();
+      b.choose("add"); b.submit(b.problem.answer + 1);
+      assert(b.bossHp === b.boss.hp && b.pendingDefense);
+      b.advance(); assert(b.phase === "defense");
+      b.submit(b.problem.answer); assert(b.hp === 100 && !b.pendingDefense);
+      b.advance(); assert(b.phase === "ready");
+    });
+    check("Boss scheduling, escalating damage, and enrage cap work", () => {
+      const b = new Battle();
+      for (let i = 1; i <= 2; i++) {
+        b.choose("add"); b.submit(b.problem.answer);
+        assert(b.pendingDefense === (i === 2)); b.advance();
+      }
+      assert(b.phase === "defense" && b.incomingDamage === 22);
+      b.submit(b.problem.answer + 1); assert(b.hp === 78);
+      b.turn = 100; assert(b.incomingDamage === b.boss.damage + 16);
+      const later = new Battle(Math.random, { level: 1 });
+      later.choose("add"); later.submit(later.problem.answer);
+      assert(later.pendingDefense);
+    });
+    check("Defeat clamps HP and terminal battles reject further actions", () => {
+      const b = new Battle(Math.random, { hp: 5 });
+      b.choose("add"); b.submit(b.problem.answer + 1); b.advance(); b.submit(b.problem.answer + 1);
+      assert(b.hp === 0 && b.phase === "lost");
+      assert(!b.advance() && !b.choose("add") && b.submit(0) === null);
+    });
+    check("Every mode generates valid questions and remains beatable through the final boss", () => {
+      for (const difficulty of Object.keys(DIFFICULTIES)) for (let level = 0; level < 5; level++) {
+        for (let i = 0; i < 100; i++) {
+          for (const move of Object.keys(MOVES)) {
+            const q = question(move, level, Math.random, difficulty);
+            assert(evaluate(q.text) === q.answer && Number.isInteger(q.answer) && q.answer >= 0);
+          }
+          const counter = counterQuestion(level, Math.random, difficulty);
+          assert(evaluate(counter.text) === counter.answer && Number.isInteger(counter.answer));
+          if (difficulty === "easy") assert(counter.text.split(" ").length === 3, "Easy counter must be single-step");
+        }
+        const battle = new Battle(Math.random, { difficulty, level, hp: 60 });
+        win(battle);
+        assert(battle.hp === 60 && battle.phase === (level === 4 ? "won" : "boss-defeated"));
+      }
+    });
+    check("Easy, Normal, Hard scale both math and combat; Easy has no enrage", () => {
+      for (let level = 0; level < 5; level++) {
+        const modes = ["easy", "normal", "hard"].map(difficulty => new Battle(() => .999, { difficulty, level }));
+        assert(modes[0].boss.hp < modes[1].boss.hp && modes[1].boss.hp < modes[2].boss.hp);
+        assert(modes[0].incomingDamage < modes[1].incomingDamage && modes[1].incomingDamage < modes[2].incomingDamage);
+        assert(modes[0].boss.every > modes[1].boss.every);
+        const initial = modes[0].incomingDamage;
+        modes.forEach(b => { b.turn = 20; });
+        assert(modes[0].incomingDamage === initial);
+        assert(modes[1].incomingDamage < modes[2].incomingDamage);
+        for (const move of Object.keys(MOVES)) {
+          const answers = ["easy", "normal", "hard"].map(mode => question(move, level, () => .999, mode).answer);
+          assert(answers[0] < answers[1] && answers[1] < answers[2], "Math should scale with difficulty");
+        }
+        const easy = new Battle(Math.random, { difficulty: "easy", level });
+        easy.choose("add"); easy.submit(easy.problem.answer);
+        assert(!easy.pendingDefense, "Easy should not counter a correct first attack");
+      }
+    });
+    check("Mode and progress persist together; legacy saves retain Hard rules", () => {
+      for (const difficulty of Object.keys(DIFFICULTIES)) {
+        const w = new World(); w.difficulty = difficulty; w.cleared = [0]; w.sentries = [1]; w.hp = 40;
+        const restored = new World(JSON.parse(JSON.stringify(w.save())));
+        assert(restored.difficulty === difficulty && restored.cleared[0] === 0 && restored.sentries[0] === 1);
+        restored.complete({ type: "boss", id: 1 }, 40);
+        assert(restored.hp === 40 + DIFFICULTIES[difficulty].bossHeal);
+        restored.complete({ type: "sentry", id: 2 }, 40);
+        assert(restored.hp === 40 + DIFFICULTIES[difficulty].sentryHeal);
+      }
+      assert(new World().difficulty === "normal");
+      assert(new World({ version: 1, cleared: [0] }).difficulty === "hard");
+      assert(new World({ version: 1, difficulty: "toString" }).difficulty === "hard");
+      assert(new Battle(Math.random, { difficulty: "nope" }).difficulty === "hard");
+    });
+    check("Movement easing is smooth and independent of frame rate", () => {
+      const { approach, cameraAt } = window.MathPixels;
+      const oneFrame = approach(0, 16, 1000 / 60);
+      assert(oneFrame > 0 && oneFrame < 16, "Movement must interpolate rather than teleport");
+      let sixty = 0, thirty = 0;
+      for (let i = 0; i < 60; i++) sixty = approach(sixty, 16, 1000 / 60);
+      for (let i = 0; i < 30; i++) thirty = approach(thirty, 16, 1000 / 30);
+      assert(Math.abs(sixty - thirty) < 1e-10 && Math.abs(sixty - 16) < .001);
+      assert(approach(16, 0, 16) > 0 && approach(16, 0, 16) < 16);
+      assert(cameraAt(0, 0).x === 0 && cameraAt(0, 0).y === 0);
+    });
+    check("Snow covers the landscape and weather and combat animate between frames", () => {
+      const pixels = window.MathPixels, landscape = pixels.createLandscape();
+      const image = landscape.getContext("2d").getImageData(0, 0, landscape.width, landscape.height).data;
+      let light = 0;
+      for (let i = 0; i < image.length; i += 4) if (image[i] > 175 && image[i+1] > 175 && image[i+2] > 175) light++;
+      assert(light / (image.length / 4) > .65, "Most terrain should be snowy, not the old grass or sand");
+      const canvas = document.createElement("canvas"); canvas.width = 640; canvas.height = 352;
+      const ctx = canvas.getContext("2d"), w = new World();
+      const player = { x: w.x, y: w.y, gait: 0, walkPhase: 0, facing: "down" };
+      pixels.drawWorld(ctx, w, landscape, player, 0);
+      const first = ctx.getImageData(0, 0, 640, 352).data;
+      pixels.drawWorld(ctx, w, landscape, player, 450);
+      const second = ctx.getImageData(0, 0, 640, 352).data;
+      let changed = 0;
+      for (let i = 0; i < first.length; i += 4) if (first[i] !== second[i] || first[i+1] !== second[i+1]) changed++;
+      assert(changed > 80, "Snow, smoke, and breathing should animate");
+      pixels.drawBattle(ctx, 0, 100, { start: 0, kind: "attack", target: "enemy", move: "divide" });
+      const before = ctx.getImageData(0, 0, 640, 260).data;
+      pixels.drawBattle(ctx, 0, 400, { start: 0, kind: "attack", target: "enemy", move: "divide" });
+      const after = ctx.getImageData(0, 0, 640, 260).data;
+      let moving = 0;
+      for (let i = 0; i < before.length; i += 4) if (before[i] !== after[i]) moving++;
+      assert(moving > 200, "Attacks must move, not just display a static damage label");
+      for (const kind of ["block", "miss", "attack"]) pixels.drawBattle(ctx, 4, 400, { start: 0, kind, target: "hero", move: "multiply" });
+    });
+    check("Map collision blocks borders, houses, water, and non-cardinal moves", () => {
+      const w = new World();
+      assert(!w.move(0, 0) && !w.move(1, 1) && !w.move(2, 0));
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          if (!walkable(x, y) && walkable(x + 1, y)) {
+            w.x = x + 1; w.y = y;
+            assert(!w.move(-1, 0) && w.x === x + 1 && w.y === y);
+          }
+        }
+      }
+      w.x = 42; w.y = 35; assert(!w.move(0, -1), "Fountain should be solid");
+    });
+    check("Every guardian and fountain is reachable from the village", () => {
+      const queue = [[44, 36]], visited = new Set(["44,36"]);
+      for (let i = 0; i < queue.length; i++) {
+        const [x, y] = queue[i];
+        for (const [dx, dy] of [[1,0], [-1,0], [0,1], [0,-1]]) {
+          const nx = x + dx, ny = y + dy, key = nx + "," + ny;
+          if (!visited.has(key) && walkable(nx, ny)) { visited.add(key); queue.push([nx, ny]); }
+        }
+      }
+      for (const p of [...SHRINES, FOUNTAIN]) assert(visited.has(p.x + "," + p.y), "Unreachable destination");
+      for (let r = 0; r < 6; r++) assert(queue.some(([x,y]) => regionAt(x,y) === r), "Unreachable region");
+      assert(visited.size > 3500, "World should contain substantial explorable terrain");
+    });
+    check("Four sigils gate the citadel; all guardians can be beaten in any order", () => {
+      const w = new World();
+      w.difficulty = "hard";
+      w.x = 44; w.y = 7;
+      assert(w.nearby().id === 4 && w.nearby().locked);
+      let hp = 40;
+      for (const level of [2, 0, 3, 1]) {
+        const b = new Battle(Math.random, { level, hp }); win(b);
+        assert(b.hp === hp && b.phase === "boss-defeated" && !b.advance());
+        w.complete({ type: "boss", id: level }, b.hp);
+        hp = Math.min(100, hp + 15); assert(w.hp === hp);
+      }
+      assert(w.sigils === 4 && !w.nearby().locked && !w.champion);
+      const final = new Battle(Math.random, { level: 4, hp: w.hp }); win(final);
+      assert(final.phase === "won" && final.bossHp === 0);
+      w.complete({ type: "boss", id: 4 }, final.hp); assert(w.champion && w.sigils === 4);
+    });
+    check("Roamers patrol walkable tiles and stay defeated; losses preserve sigils", () => {
+      const w = new World();
+      w.difficulty = "hard";
+      for (let i = 0; i < 10; i++) {
+        w.roam();
+        assert(w.roamers.every(p => walkable(p.x, p.y)));
+      }
+      const p = w.roamers[0]; w.x = p.x; w.y = p.y;
+      assert(w.encounter().type === "sentry");
+      const b = new Battle(Math.random, { level: 0, enemy: { name: p.name, hp: 48, damage: 12, every: 1 } });
+      win(b); w.complete({ type: "sentry", id: p.id }, 50);
+      assert(w.hp === 55 && w.encounter() === null);
+      w.complete({ type: "boss", id: 2 }, 50); w.respawn();
+      assert(w.hp === 100 && w.x === 44 && w.y === 36 && w.cleared.includes(2));
+    });
+    check("Saved progress round-trips; corrupt fields cannot break the world", () => {
+      const w = new World(); w.x = 13; w.y = 15; w.hp = 55; w.cleared = [0, 2]; w.sentries = [1, 3];
+      const restored = new World(JSON.parse(JSON.stringify(w.save())));
+      assert(JSON.stringify(w.save()) === JSON.stringify(restored.save()));
+      const bad = new World({ version: 1, x: -100, y: Infinity, hp: -5, cleared: [4, 4, 0, 99, "2"], sentries: [0, 0, 99, null] });
+      assert(bad.x === 44 && bad.y === 36 && bad.hp === 100);
+      assert(bad.cleared.join() === "0" && bad.sentries.join() === "0");
+      assert(new World({ version: 99, cleared: [0] }).sigils === 0);
+    });
+    document.getElementById("game").addEventListener("load", () => {
+      const doc = document.getElementById("game").contentDocument;
+      const win = document.getElementById("game").contentWindow;
+      const click = selector => doc.querySelector(selector).click();
+      const key = name => {
+        doc.getElementById("world").dispatchEvent(new win.KeyboardEvent("keydown", { key: name, bubbles: true }));
+        doc.getElementById("world").dispatchEvent(new win.KeyboardEvent("keyup", { key: name, bubbles: true }));
+      };
+      const answer = value => {
+        doc.getElementById("answer").value = value; doc.getElementById("question-panel").requestSubmit();
+      };
+      const selectMode = mode => {
+        doc.getElementById("difficulty").value = mode;
+        doc.getElementById("difficulty").dispatchEvent(new win.Event("change", { bubbles: true }));
+      };
+      const practice = () => {
+        assert(!doc.getElementById("math-facts").hidden && doc.getElementById("battle").hidden);
+        assert(doc.getElementById("fact-steps").children.length > 0);
+        assert(doc.getElementById("close-facts").hidden, "Must practice before returning");
+        const hp = doc.getElementById("hero-hp").textContent, turn = doc.getElementById("battle-turn").textContent;
+        const submitPractice = value => {
+          doc.getElementById("practice-answer").value = value;
+          doc.getElementById("practice-form").requestSubmit();
+        };
+        click("#continue"); click("#close-facts");
+        assert(!doc.getElementById("math-facts").hidden, "Cannot bypass required practice");
+        submitPractice("");
+        assert(doc.getElementById("practice-feedback").textContent.includes("whole number"));
+        submitPractice(-999);
+        assert(doc.getElementById("practice-feedback").textContent.includes("No HP lost"));
+        const expression = doc.getElementById("practice-question").textContent.replace("Your turn: ", "").replace(" = ?", "");
+        submitPractice(evaluate(expression));
+        assert(!doc.getElementById("close-facts").hidden);
+        assert(doc.getElementById("hero-hp").textContent === hp && doc.getElementById("battle-turn").textContent === turn);
+        click("#close-facts");
+        assert(doc.getElementById("math-facts").hidden && !doc.getElementById("battle").hidden);
+      };
+      check("UI: map, walking, roaming encounter, four moves, defense, victory and healing", () => {
+        assert(!doc.getElementById("overworld").hidden && doc.getElementById("battle").hidden);
+        assert(doc.getElementById("difficulty").value === "normal");
+        selectMode("easy");
+        assert(doc.getElementById("mode-description").textContent.includes("No enrage"));
+        selectMode("hard");
+        click("#interact"); assert(doc.getElementById("world-message").textContent.includes("GUIDE:"));
+        click("#map-button"); assert(!doc.getElementById("map-overlay").hidden);
+        click("#close-map"); assert(doc.getElementById("map-overlay").hidden);
+        key("ArrowUp"); key("ArrowUp"); key("ArrowUp");
+        for (let i = 0; i < 12; i++) key("ArrowLeft");
+        key("ArrowDown");
+        for (let i = 0; i < 3 && doc.getElementById("battle").hidden; i++) key("ArrowLeft");
+        assert(!doc.getElementById("battle").hidden, "Walking into a roamer should start battle");
+        assert(doc.querySelectorAll("[data-move]").length === 4);
+        assert(doc.getElementById("boss-name").textContent === "Plus Punk");
+        assert(doc.getElementById("difficulty").disabled, "Cannot change rules mid-battle");
+        selectMode("easy");
+        assert(doc.getElementById("difficulty").value === "hard", "Mode change should be rejected during battle");
+        const frame = document.getElementById("game");
+        frame.width = 320;
+        assert(doc.documentElement.scrollWidth <= 320, "Battle overflows a small phone");
+        frame.width = 400;
+        click('[data-move="divide"]');
+        answer(""); assert(doc.getElementById("input-error").textContent.length > 0);
+        answer(evaluate(doc.getElementById("equation").textContent.replace(" = ?", "")));
+        assert(doc.getElementById("boss-hp").textContent === "14 / 48 HP");
+        click("#continue");
+        assert(doc.getElementById("answer-button").textContent.includes("Block"));
+        answer(-999); assert(doc.getElementById("hero-hp").textContent === "86 / 100 HP");
+        practice();
+        click("#continue"); click('[data-move="divide"]');
+        answer(evaluate(doc.getElementById("equation").textContent.replace(" = ?", "")));
+        assert(doc.getElementById("panel-label").textContent === "VICTORY");
+        click("#continue");
+        assert(!doc.getElementById("overworld").hidden && doc.getElementById("world-hp").textContent === "91");
+        assert(!doc.getElementById("difficulty").disabled);
+        click("#open-facts");
+        assert(doc.getElementById("fact-list").children.length === 1);
+        doc.getElementById("fact-list").firstChild.click();
+        assert(doc.getElementById("fact-solution").textContent.includes(" = "));
+        click("#close-facts");
+        click("#restart"); assert(doc.getElementById("reset-dialog").open);
+        click("#cancel-reset"); assert(!doc.getElementById("reset-dialog").open);
+        click("#restart"); click("#confirm-reset");
+        assert(!doc.getElementById("overworld").hidden && doc.getElementById("world-hp").textContent === "100");
+        assert(doc.getElementById("difficulty").value === "hard", "New adventure should keep chosen mode");
+        key("ArrowUp"); key("ArrowLeft"); key("ArrowLeft"); click("#interact");
+        assert(doc.getElementById("world-message").textContent.includes("restores all your HP"));
+        assert(doc.documentElement.scrollWidth <= 400, "Game overflows a mobile viewport");
+        document.getElementById("game").width = 320;
+        selectMode("easy");
+        assert(doc.getElementById("difficulty").value === "easy");
+        assert(doc.documentElement.scrollWidth <= 320, "World overflows a small phone");
+      });
+      check("UI: custom strongest damage, attack lessons, and defeat lessons preserve battle results", () => {
+        selectMode("hard");
+        doc.getElementById("strongest").value = "add";
+        doc.getElementById("strongest").dispatchEvent(new win.Event("change", { bubbles: true }));
+        assert(doc.querySelector('[data-move="add"] b').textContent === "34DMG");
+        assert(doc.querySelector('[data-move="divide"] b').textContent === "24DMG");
+        click("#restart"); click("#confirm-reset");
+        assert(doc.getElementById("strongest").value === "add");
+        key("ArrowUp"); key("ArrowUp"); key("ArrowUp");
+        for (let i = 0; i < 12; i++) key("ArrowLeft");
+        key("ArrowDown");
+        for (let i = 0; i < 3 && doc.getElementById("battle").hidden; i++) key("ArrowLeft");
+        assert(doc.getElementById("strongest").disabled);
+        doc.getElementById("strongest").value = "subtract";
+        doc.getElementById("strongest").dispatchEvent(new win.Event("change", { bubbles: true }));
+        assert(doc.getElementById("strongest").value === "add");
+        click('[data-move="add"]');
+        assert(doc.getElementById("panel-description").textContent.includes("34 damage"));
+        answer(evaluate(doc.getElementById("equation").textContent.replace(" = ?", "")));
+        assert(doc.getElementById("boss-hp").textContent === "14 / 48 HP");
+        click("#continue");
+        for (let i = 0; i < 12; i++) {
+          if (!doc.getElementById("moves").hidden) click('[data-move="subtract"]');
+          answer(-999);
+          assert(doc.documentElement.scrollWidth <= 320, "Lesson overflows small phones");
+          practice();
+          if (doc.getElementById("panel-label").textContent === "DEFEATED, NOT FINISHED") break;
+          click("#continue");
+        }
+        assert(doc.getElementById("hero-hp").textContent === "0 / 100 HP");
+        assert(doc.getElementById("boss-hp").textContent === "14 / 48 HP", "Practice must not deal attack damage");
+        click("#continue");
+        assert(!doc.getElementById("overworld").hidden && doc.getElementById("world-hp").textContent === "100");
+        click("#open-facts");
+        assert(doc.getElementById("fact-list").children.length > 1, "Attack and defense mistakes should be collected");
+        assert(doc.getElementById("fact-list").textContent.includes("Practiced"));
+        click("#close-facts");
+      });
+      check("Pixel renderer draws original art to world and minimap canvases", () => {
+        const canvas = doc.getElementById("mini-map");
+        const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+        const colors = new Set();
+        for (let i = 0; i < data.length; i += 4) colors.add([data[i], data[i+1], data[i+2]].join(","));
+        assert(colors.size > 20, "Minimap art is missing");
+      });
+      document.getElementById("results").textContent = lines.join("\n") + "\n\n" + (failures ? failures + " FAILED" : "ALL CHECKS PASSED");
+      document.title = failures ? "FAIL" : "PASS";
+    });
+  </script>
+</body>
+</html>
